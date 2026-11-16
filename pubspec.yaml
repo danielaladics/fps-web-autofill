@@ -1,0 +1,13 @@
+name: fps_web_autofill
+description: Browser autofill suggestions on the first click for Flutter web text fields (desktop pointer).
+version: 1.0.0
+publish_to: none
+
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+  flutter: ">=3.22.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  web: ">=1.0.0 <2.0.0"
