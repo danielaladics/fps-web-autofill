@@ -10,7 +10,11 @@
 //  - ha a felhasználó választ, minden kitöltött érték a Flutter-mezőkbe kerül;
 //  - ha inkább gépel, a leütött karakter a Flutter-mezőbe kerül, és a fókusz
 //    átmegy a Flutter-mezőre.
-// Érintőképernyőn (nincs egérmutató) nem csinál semmit.
+// Érintőképernyőn általában nem csinál semmit. KIVÉTEL iPhone/iPad (2026-11-19):
+// ott a Flutter saját megoldása nem hozza elő az „AutoFill" javaslatot, ezért az
+// aktuális oldal üres, nem jelszó mezői fölött ÁLLANDÓAN ott van a valódi <input>
+// (a koppintás így rá esik, az iOS felkínálja a mentett névjegyet). A mezőn kezdett
+// húzást a Flutter-felületnek adjuk tovább, hogy a görgetés működjön.
 import 'dart:async';
 import 'dart:js_interop';
 
@@ -100,11 +104,36 @@ class _Motor {
   double _px = 0, _py = 0;
   Timer? _kitoltesIdozito;
 
+  // ---- iOS érintéses mód ----
+  final bool _ios = _iosE();
+  List<_Mezo> _erintoMezok = [];
+  double _hx0 = 0, _hy0 = 0; // az érintés kezdőpontja
+  int? _hId; // az érintés azonosítója
+  bool _huzas = false; // a mozdulat húzás lett: a Flutter kapja
+
+  static bool _iosE() {
+    try {
+      final n = web.window.navigator;
+      final ua = n.userAgent;
+      return RegExp(r'iPhone|iPad|iPod').hasMatch(ua) ||
+          (ua.contains('Macintosh') && n.maxTouchPoints > 1);
+    } catch (_) {
+      return false;
+    }
+  }
+
   void indit() {
     WidgetsBinding.instance.addPersistentFrameCallback((_) {
       _kepkocka++;
-      _igazit();
+      if (_ios) {
+        try {
+          _erintoIgazit();
+        } catch (_) {}
+      } else {
+        _igazit();
+      }
     });
+    if (_ios) return; // iOS-en nincs egér, nincs egérmozgás-figyelés
     web.window.addEventListener(
         'pointermove',
         ((web.PointerEvent e) {
@@ -369,9 +398,14 @@ input.fpsaf:-webkit-autofill{-webkit-box-shadow:0 0 0 1000px transparent inset;-
     inp.addEventListener(
         'blur',
         ((web.Event _) {
+          if (_ios) {
+            if (identical(_atadva?.input, inp)) _atadva = null;
+            return;
+          }
           if (!identical(_aktiv?.input, inp)) inp.style.pointerEvents = 'none';
           if (identical(_atadva?.input, inp)) _atadva = null;
         }).toJS);
+    if (_ios) _erintesKezeles(inp);
     return inp;
   }
 
@@ -477,6 +511,140 @@ input.fpsaf:-webkit-autofill{-webkit-box-shadow:0 0 0 1000px transparent inset;-
         }
       });
     }
+  }
+
+  // ---- iOS: állandó szellemmezők + húzás továbbadása ----
+
+  /// Képkockánként: az aktuális oldal üres, nem jelszó, nem fókuszált mezői
+  /// fölött ott a valódi <input>; a többi szellemmező félreáll.
+  void _erintoIgazit() {
+    if (_atadva != null) {
+      // gépelés közben a fókusz a Flutter-mezőn van, a szellemmezők pihennek
+      for (final m in _erintoMezok) {
+        m.input?.style.pointerEvents = 'none';
+      }
+      return;
+    }
+    _gyujt(false);
+    final aktivak = _mezok
+        .where((m) =>
+            m.el &&
+            !m.jelszo &&
+            (m.route == null || m.route!.isCurrent) &&
+            m.ures &&
+            !m.w.focusNode.hasFocus)
+        .toList();
+    final form = _urlap();
+    var i = 0;
+    for (final m in aktivak) {
+      final inp = m.input ?? _ujInput(m);
+      m.input = inp;
+      inp.id = 'fpsaf-${i++}';
+      if (inp.parentElement == null || !identical(inp.parentElement, form)) {
+        form.append(inp);
+      }
+      _helyez(m);
+      // csak a látható (képernyőn lévő) mező fogja el az érintést
+      final r = inp.getBoundingClientRect();
+      final lathato = r.bottom > 0 && r.top < web.window.innerHeight && r.height > 4;
+      if (!identical(web.document.activeElement, inp)) {
+        inp.style.pointerEvents = lathato ? 'auto' : 'none';
+      }
+    }
+    for (final m in _erintoMezok) {
+      if (!aktivak.contains(m)) {
+        final inp = m.input;
+        if (inp == null) continue;
+        if (identical(web.document.activeElement, inp)) continue;
+        inp.style.pointerEvents = 'none';
+        if (!_mezok.contains(m) || m.route != null && !m.route!.isCurrent) {
+          inp.remove();
+        }
+      }
+    }
+    _erintoMezok = aktivak;
+  }
+
+  web.Element? _flutterCel() =>
+      web.document.querySelector('flt-glass-pane') ?? _flutterView();
+
+  void _tovabbad(String tipus, double x, double y, int id) {
+    final cel = _flutterCel();
+    if (cel == null) return;
+    cel.dispatchEvent(web.PointerEvent(
+        tipus,
+        web.PointerEventInit(
+          bubbles: true,
+          cancelable: true,
+          composed: true,
+          pointerId: id,
+          pointerType: 'touch',
+          isPrimary: true,
+          clientX: x.round(),
+          clientY: y.round(),
+          screenX: x.round(),
+          screenY: y.round(),
+          button: tipus == 'pointermove' ? -1 : 0,
+          buttons: tipus == 'pointerup' || tipus == 'pointercancel' ? 0 : 1,
+          pressure: tipus == 'pointerup' ? 0 : 0.5,
+          width: 1,
+          height: 1,
+        )));
+  }
+
+  /// A szellemmezőn kezdett érintés: koppintás → a valódi <input> kapja (iOS
+  /// AutoFill), húzás → a Flutter-felület kapja (görgetés).
+  void _erintesKezeles(web.HTMLInputElement inp) {
+    inp.style.setProperty('touch-action', 'none');
+    inp.addEventListener(
+        'pointerdown',
+        ((web.PointerEvent e) {
+          if (e.pointerType == 'mouse') return;
+          _hx0 = e.clientX.toDouble();
+          _hy0 = e.clientY.toDouble();
+          _hId = e.pointerId;
+          _huzas = false;
+        }).toJS);
+    inp.addEventListener(
+        'pointermove',
+        ((web.PointerEvent e) {
+          if (_hId != e.pointerId) return;
+          final x = e.clientX.toDouble(), y = e.clientY.toDouble();
+          if (!_huzas) {
+            if ((x - _hx0).abs() < 8 && (y - _hy0).abs() < 8) return;
+            _huzas = true;
+            _tovabbad('pointerdown', _hx0, _hy0, 7701);
+          }
+          e.preventDefault();
+          _tovabbad('pointermove', x, y, 7701);
+        }).toJS,
+        web.AddEventListenerOptions(passive: false));
+    void vege(web.PointerEvent e) {
+      if (_hId != e.pointerId) return;
+      _hId = null;
+      if (_huzas) {
+        e.preventDefault();
+        _tovabbad('pointerup', e.clientX.toDouble(), e.clientY.toDouble(), 7701);
+      }
+    }
+
+    inp.addEventListener('pointerup', ((web.PointerEvent e) => vege(e)).toJS,
+        web.AddEventListenerOptions(passive: false));
+    inp.addEventListener('pointercancel', ((web.PointerEvent e) => vege(e)).toJS,
+        web.AddEventListenerOptions(passive: false));
+    // húzás után ne kapja meg a fókuszt (ne jöjjön fel a billentyűzet)
+    inp.addEventListener(
+        'touchend',
+        ((web.Event e) {
+          if (_huzas) e.preventDefault();
+        }).toJS,
+        web.AddEventListenerOptions(passive: false));
+    inp.addEventListener(
+        'touchmove',
+        ((web.Event e) {
+          e.preventDefault();
+        }).toJS,
+        web.AddEventListenerOptions(passive: false));
   }
 
   // ---- böngészős kitöltés: értékek a Flutter-mezőkbe ----
